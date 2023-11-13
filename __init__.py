@@ -31,6 +31,7 @@ except Exception as fe:
     sys.stderr.write(f"{fe}")
     sys.stderr.flush()
 
+
 # partially based on scipy's template matcher
 class skimage_deprecation(Warning):
     """Create our own deprecation class, since Python >= 2.7
@@ -1039,6 +1040,251 @@ def resize_image(
         sys.stderr.write(f"{e}\n")
         sys.stderr.flush()
         return np.array([], dtype=np.int16)
+
+
+def matchtemplatex(
+    haystack2chan,
+    needle,
+    needlename,
+    indexf,
+    thresh=0.7,
+    pad_input=False,
+    mode="constant",
+    constant_values=0,
+):
+    rav = match_template(
+        image=haystack2chan,
+        template=needle,
+        pad_input=pad_input,
+        mode=mode,
+        constant_values=constant_values,
+    )
+    scale_percent = 100
+    width = needle.shape[1]
+    height = needle.shape[0]
+
+    try:
+        va = numexpr.evaluate(
+            "max( a )", global_dict={}, local_dict={"a": rav}
+        )  # .valu
+        argmaxx = numexpr.evaluate(
+            "a>=va", global_dict={}, local_dict={"a": rav, "va": va}
+        )
+        argi = rav[argmaxx]
+        if argi < thresh:
+            return np.array([], dtype=np.int16)
+        subx = numexpr.evaluate(
+            "(rav <= argi) & (rav >= thresh)",
+            global_dict={},
+            local_dict={"rav": rav, "argi": argi, "thresh": thresh},
+        )
+        ras = np.where(subx)
+        yx = np.vstack(ras).T
+
+        dfxc = pd.DataFrame([yx[..., 1], yx[..., 0]]).T
+        dfxc.columns = ["aa_start_x", "aa_start_y"]
+        dfxc["aa_scale_factor"] = scale_percent
+        dfxc["aa_width"] = width
+        dfxc["aa_height"] = height
+
+        try:
+            dfxc["aa_match"] = argi[0]
+        except Exception:
+            dfxc["aa_match"] = argi
+
+        dfxc["aa_end_x"] = numexpr.evaluate(
+            "a+b",
+            global_dict={},
+            local_dict={"a": dfxc["aa_start_x"], "b": dfxc["aa_width"]},
+        )
+
+        dfxc["aa_end_y"] = numexpr.evaluate(
+            "a+b",
+            global_dict={},
+            local_dict={"a": dfxc["aa_start_y"], "b": dfxc["aa_height"]},
+        )
+
+        dfxc["aa_center_x"] = numexpr.evaluate(
+            "a+(b/2)",
+            global_dict={},
+            local_dict={"a": dfxc["aa_start_x"], "b": dfxc["aa_width"]},
+        )
+
+        dfxc["aa_center_y"] = numexpr.evaluate(
+            "a+(b/2)",
+            global_dict={},
+            local_dict={"a": dfxc["aa_start_y"], "b": dfxc["aa_height"]},
+        )
+
+        dfxc["aa_area"] = numexpr.evaluate(
+            "a*b",
+            global_dict={},
+            local_dict={"a": dfxc["aa_width"], "b": dfxc["aa_height"]},
+        )
+        dfxc["aa_needlename"] = needlename
+        dfxc["aa_img_index"] = indexf
+        return dfxc
+    except Exception as e:
+        sys.stderr.write(f"{e}")
+        sys.stderr.flush()
+
+        return np.array([], dtype=np.int16)
+
+
+def find_needles_in_multi_haystacks(
+    haystacks,
+    needles,
+    with_image_data=True,
+    thresh=0.9,
+    pad_input=False,
+    mode="constant",
+    constant_values=0,
+    usecache=True,
+    processes=5,
+    chunks=1,
+    print_stdout=False,
+    print_stderr=True,
+):
+    r"""
+    Find occurrences of multiple needle images in multiple haystack images using template matching.
+
+    Parameters:
+    - haystacks (List[str]): List of haystack images.
+    - needles (Dict[str, str]): Dictionary where keys are needle names and values are the needle images.
+    - with_image_data (bool, optional): If True, include image data in the result DataFrame. Default is True.
+    - thresh (float, optional): Threshold for matching. Values below this threshold are considered non-matches. Default is 0.9.
+    - pad_input (bool, optional): If True, pad the input image. Default is False.
+    - mode (str, optional): Padding mode. Default is 'constant'.
+    - constant_values (int, optional): Constant value for padding. Default is 0.
+    - usecache (bool, optional): If True, use caching during multiprocessing. Default is True.
+    - processes (int, optional): Number of processes to use for multiprocessing. Default is 5.
+    - chunks (int, optional): Chunk size for multiprocessing. Default is 1.
+    - print_stdout (bool, optional): If True, print stdout during multiprocessing. Default is False.
+    - print_stderr (bool, optional): If True, print stderr during multiprocessing. Default is True.
+
+    Returns:
+    - DataFrame: Result DataFrame containing information about matched occurrences.
+      Columns include 'aa_start_x', 'aa_start_y', 'aa_scale_factor', 'aa_width', 'aa_height',
+      'aa_match', 'aa_end_x', 'aa_end_y', 'aa_center_x', 'aa_center_y', 'aa_area', 'aa_needlename',
+      'aa_img_index'.
+      If with_image_data is True, additional columns include 'aa_screenshot', 'aa_r', 'aa_g', 'aa_b'.
+
+    Raises:
+    - Exception: If an error occurs during multiprocessing or matching.
+
+    Notes:
+    - The 'aa_old_index' column is retained from individual matches.
+    """
+
+    haystack2chans = [
+        open_image_in_cv(haystack, channels_in_output=2).astype(np.float64)
+        for haystack in haystacks
+    ]
+    allfs = []
+    for official_needle_name, needle in needles.items():
+        pic = open_image_in_cv(needle, channels_in_output=2)
+
+        allfs.extend(
+            [
+                MultiProcExecution(
+                    fu=matchtemplatex,
+                    args=(
+                        haystack2chan,
+                        pic,
+                        official_needle_name,
+                        imageindex,
+                        thresh,
+                        pad_input,
+                        mode,
+                        constant_values,
+                    ),
+                    kwargstuple=(),
+                )
+                for imageindex, haystack2chan in enumerate(haystack2chans)
+            ]
+        )
+
+    try:
+        dfsxx, raw_data = start_multiprocessing(
+            it=allfs,
+            usecache=usecache,
+            processes=processes,
+            chunks=chunks,
+            print_stdout=print_stdout,
+            print_stderr=print_stderr,
+        )
+
+        dfxc = pd.concat(
+            [x for x in dfsxx.values() if isinstance(x, pd.DataFrame)],
+            ignore_index=True,
+        )
+        if with_image_data:
+            haystack3chans = [
+                open_image_in_cv(haystack, channels_in_output=3)
+                for haystack in haystacks
+            ]
+
+            dfxc["aa_screenshot"] = dfxc.apply(
+                lambda fr: haystack3chans[int(fr.aa_img_index)][
+                    int(fr["aa_start_y"]) : int(fr["aa_start_y"])
+                    + int(fr["aa_height"]),
+                    int(fr["aa_start_x"]) : int(fr["aa_start_x"]) + int(fr["aa_width"]),
+                ],
+                axis=1,
+            )
+
+            dfxc["aa_r"] = numexpr.evaluate(
+                "a/b",
+                global_dict={},
+                local_dict={
+                    "a": numexpr.evaluate(
+                        "sum(a)",
+                        global_dict={},
+                        local_dict={"a": dfxc.aa_screenshot.__array__()[0][..., 2]},
+                    ),
+                    "b": (
+                        dfxc.aa_screenshot.__array__()[0][..., 2].shape[0]
+                        * dfxc.aa_screenshot.__array__()[0][..., 2].shape[1]
+                    ),
+                },
+            )
+            dfxc["aa_g"] = numexpr.evaluate(
+                "a/b",
+                global_dict={},
+                local_dict={
+                    "a": numexpr.evaluate(
+                        "sum(a)",
+                        global_dict={},
+                        local_dict={"a": dfxc.aa_screenshot.__array__()[0][..., 1]},
+                    ),
+                    "b": (
+                        dfxc.aa_screenshot.__array__()[0][..., 1].shape[0]
+                        * dfxc.aa_screenshot.__array__()[0][..., 1].shape[1]
+                    ),
+                },
+            )
+
+            dfxc["aa_b"] = numexpr.evaluate(
+                "a/b",
+                global_dict={},
+                local_dict={
+                    "a": numexpr.evaluate(
+                        "sum(a)",
+                        global_dict={},
+                        local_dict={"a": dfxc.aa_screenshot.__array__()[0][..., 0]},
+                    ),
+                    "b": (
+                        dfxc.aa_screenshot.__array__()[0][..., 0].shape[0]
+                        * dfxc.aa_screenshot.__array__()[0][..., 0].shape[1]
+                    ),
+                },
+            )
+        return dfxc
+
+    except Exception as fex:
+        sys.stderr.write(f"{fex}\n")
+        sys.stderr.flush()
+        return pd.DataFrame()
 
 
 def find_needle_in_haystack(
